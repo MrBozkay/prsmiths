@@ -1,0 +1,263 @@
+import gc
+import io
+import tarfile
+import unicodedata
+import warnings
+
+import pytest
+
+from app import archive
+from app.archive import ArchiveError, extract_tarball
+from tests.unit.archives import build
+
+
+def test_top_level_directory_is_stripped(tmp_path):
+    src = build(
+        tmp_path / "a.tar.gz",
+        [
+            ("owner-repo-abc123", None),
+            ("owner-repo-abc123/pkg", None),
+            ("owner-repo-abc123/pkg/mod.py", b"x = 1\n"),
+            ("owner-repo-abc123/README.md", b"hi\n"),
+        ],
+    )
+    out = extract_tarball(src, tmp_path / "repo")
+    assert out == tmp_path / "repo"
+    assert (out / "pkg" / "mod.py").read_text() == "x = 1\n"
+    assert (out / "README.md").read_text() == "hi\n"
+    assert not (out / "owner-repo-abc123").exists()
+
+
+def test_two_top_level_entries_or_none_are_refused(tmp_path):
+    two = build(tmp_path / "b.tar.gz", [("a/x", b"1"), ("b/y", b"2")])
+    with pytest.raises(ArchiveError, match="exactly one top-level"):
+        extract_tarball(two, tmp_path / "r1")
+    flat = build(tmp_path / "c.tar.gz", [("x.py", b"1")])
+    with pytest.raises(ArchiveError, match="exactly one top-level"):
+        extract_tarball(flat, tmp_path / "r2")
+    empty = build(tmp_path / "d.tar.gz", [])
+    with pytest.raises(ArchiveError, match="exactly one top-level"):
+        extract_tarball(empty, tmp_path / "r3")
+
+
+def test_traversal_is_refused(tmp_path):
+    src = build(tmp_path / "t.tar.gz", [("top/ok", b"1"), ("top/../../evil", b"x")])
+    with pytest.raises(ArchiveError, match=archive.UNSAFE_PATH):
+        extract_tarball(src, tmp_path / "repo")
+    assert not (tmp_path / "evil").exists()
+    assert not (tmp_path / "repo" / "ok").exists()  # nothing extracted before the check
+
+
+def test_absolute_path_is_refused(tmp_path):
+    src = build(tmp_path / "t.tar.gz", [("/etc/evil", b"x")])
+    with pytest.raises(ArchiveError, match=archive.UNSAFE_PATH):
+        extract_tarball(src, tmp_path / "repo")
+
+
+def test_links_are_refused(tmp_path):
+    for kind in ("sym", "hard"):
+        src = build(
+            tmp_path / f"{kind}.tar.gz",
+            [("top/a", b"1"), ("top/link", (kind, "/etc/passwd"))],
+        )
+        with pytest.raises(ArchiveError, match=archive.HAS_LINKS):
+            extract_tarball(src, tmp_path / f"repo-{kind}")
+
+
+def test_too_many_files_is_refused(tmp_path):
+    src = build(tmp_path / "t.tar.gz", [(f"top/f{i}", b"1") for i in range(5)])
+    with pytest.raises(ArchiveError, match=archive.TOO_MANY_FILES):
+        extract_tarball(src, tmp_path / "repo", max_files=4)
+    extract_tarball(src, tmp_path / "ok", max_files=5)
+
+
+def test_too_large_is_refused(tmp_path):
+    src = build(tmp_path / "t.tar.gz", [("top/a", b"x" * 60), ("top/b", b"y" * 60)])
+    with pytest.raises(ArchiveError, match=archive.TOO_LARGE):
+        extract_tarball(src, tmp_path / "repo", max_bytes=100)
+    extract_tarball(src, tmp_path / "ok", max_bytes=120)
+
+
+def test_a_negative_directory_size_cannot_hide_bytes(tmp_path):
+    path = tmp_path / "neg.tar.gz"
+    with tarfile.open(path, "w:gz", format=tarfile.PAX_FORMAT) as tar:
+        top = tarfile.TarInfo("top")
+        top.type = tarfile.DIRTYPE
+        tar.addfile(top)
+        sneaky = tarfile.TarInfo("top/d")
+        sneaky.type = tarfile.DIRTYPE
+        sneaky.pax_headers = {"size": "-100000000"}
+        tar.addfile(sneaky)
+        data = b"x" * 5000
+        big = tarfile.TarInfo("top/big")
+        big.size = len(data)
+        tar.addfile(big, io.BytesIO(data))
+    with pytest.raises(ArchiveError):
+        extract_tarball(path, tmp_path / "repo", max_bytes=1000)
+    assert not (tmp_path / "repo" / "big").exists()
+
+
+def test_a_directory_with_a_size_is_refused(tmp_path):
+    path = tmp_path / "dsize.tar.gz"
+    with tarfile.open(path, "w:gz") as tar:
+        for name, size in (("top", 0), ("top/d", 10)):
+            info = tarfile.TarInfo(name)
+            info.type = tarfile.DIRTYPE
+            info.size = size
+            tar.addfile(info)
+    with pytest.raises(ArchiveError):
+        extract_tarball(path, tmp_path / "repo")
+
+
+@pytest.mark.parametrize("kind", [tarfile.FIFOTYPE, tarfile.CHRTYPE, tarfile.BLKTYPE])
+def test_fifos_and_devices_are_refused(tmp_path, kind):
+    path = tmp_path / "special.tar.gz"
+    with tarfile.open(path, "w:gz") as tar:
+        top = tarfile.TarInfo("top")
+        top.type = tarfile.DIRTYPE
+        tar.addfile(top)
+        special = tarfile.TarInfo("top/dev")
+        special.type = kind
+        tar.addfile(special)
+    with pytest.raises(ArchiveError, match=archive.HAS_LINKS):
+        extract_tarball(path, tmp_path / "repo")
+
+
+@pytest.mark.parametrize(
+    "name", ["top/.git/config", "top/sub/.GIT/hooks/x", "top/.Git", "top/a/.git"]
+)
+def test_repository_metadata_components_are_refused(tmp_path, name):
+    src = build(tmp_path / "g.tar.gz", [("top/ok", b"1"), (name, b"x")])
+    with pytest.raises(ArchiveError, match=archive.UNSAFE_PATH):
+        extract_tarball(src, tmp_path / "repo")
+    assert not (tmp_path / "repo" / "ok").exists()
+
+
+def test_similar_names_are_allowed(tmp_path):
+    src = build(
+        tmp_path / "g.tar.gz",
+        [("top/.gitignore", b"x"), ("top/.github/ci.yml", b"y"), ("top/a.git", b"z")],
+    )
+    out = extract_tarball(src, tmp_path / "repo")
+    assert (out / ".gitignore").exists() and (out / ".github" / "ci.yml").exists()
+
+
+def test_case_folded_duplicates_are_refused(tmp_path):
+    src = build(tmp_path / "c.tar.gz", [("top/A.txt", b"1"), ("top/a.txt", b"2")])
+    with pytest.raises(ArchiveError, match=archive.UNSAFE_PATH):
+        extract_tarball(src, tmp_path / "repo")
+    exact = build(tmp_path / "e.tar.gz", [("top/a.txt", b"1"), ("top/a.txt", b"2")])
+    with pytest.raises(ArchiveError, match=archive.UNSAFE_PATH):
+        extract_tarball(exact, tmp_path / "repo2")
+
+
+def test_nfc_and_nfd_spellings_of_one_name_are_duplicates(tmp_path):
+    nfc = unicodedata.normalize("NFC", "é.py")
+    nfd = unicodedata.normalize("NFD", "é.py")
+    assert nfc != nfd
+    src = build(tmp_path / "u.tar.gz", [(f"top/{nfc}", b"a"), (f"top/{nfd}", b"b")])
+    with pytest.raises(ArchiveError, match=archive.UNSAFE_PATH):
+        extract_tarball(src, tmp_path / "repo")
+
+
+def test_a_huge_extended_header_is_bounded_while_reading(tmp_path):
+    path = tmp_path / "long.tar.gz"
+    with tarfile.open(path, "w:gz", format=tarfile.GNU_FORMAT) as tar:
+        top = tarfile.TarInfo("top")
+        top.type = tarfile.DIRTYPE
+        tar.addfile(top)
+        # A GNU long-name record is read whole into memory by tarfile.
+        info = tarfile.TarInfo("top/" + "n" * 3_000_000)
+        info.size = 1
+        tar.addfile(info, io.BytesIO(b"x"))
+    with pytest.raises(ArchiveError, match=archive.TOO_LARGE):
+        extract_tarball(path, tmp_path / "repo", max_files=10, max_bytes=1000)
+
+
+def test_a_bomb_is_bounded_by_the_decompressed_size(tmp_path):
+    path = tmp_path / "bomb.tar.gz"
+    with tarfile.open(path, "w:gz") as tar:
+        top = tarfile.TarInfo("top")
+        top.type = tarfile.DIRTYPE
+        tar.addfile(top)
+        for i in range(3):
+            data = b"\0" * 2_000_000
+            info = tarfile.TarInfo(f"top/f{i}")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    assert path.stat().st_size < 100_000
+    with pytest.raises(ArchiveError, match=archive.TOO_LARGE):
+        extract_tarball(path, tmp_path / "repo", max_bytes=1_000_000)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["top/.g‌it/config", "top/.g️it/config", "top/.​git", "top/.ǴIT/x"],
+)
+def test_the_git_check_ignores_invisible_characters(tmp_path, name):
+    src = build(tmp_path / "g.tar.gz", [("top/ok", b"1"), (name, b"x")])
+    with pytest.raises(ArchiveError, match=archive.UNSAFE_PATH):
+        extract_tarball(src, tmp_path / "repo")
+
+
+@pytest.mark.parametrize("mode", ["w:bz2", "w:xz"])
+def test_only_gzip_and_plain_tar_are_accepted(tmp_path, mode):
+    path = tmp_path / "a.tar"
+    with tarfile.open(path, mode) as tar:
+        info = tarfile.TarInfo("top/f")
+        info.size = 1
+        tar.addfile(info, io.BytesIO(b"x"))
+    with pytest.raises(ArchiveError, match=archive.NOT_AN_ARCHIVE):
+        extract_tarball(path, tmp_path / "repo")
+
+
+def test_a_corrupt_xz_file_is_a_fixed_refusal(tmp_path):
+    path = tmp_path / "bad.tar.xz"
+    path.write_bytes(b"\xfd7zXZ\x00" + b"garbage" * 50)
+    with pytest.raises(ArchiveError, match=archive.NOT_AN_ARCHIVE):
+        extract_tarball(path, tmp_path / "repo")
+
+
+def test_a_plain_tar_is_accepted(tmp_path):
+    path = tmp_path / "a.tar"
+    with tarfile.open(path, "w") as tar:
+        info = tarfile.TarInfo("top/f")
+        info.size = 1
+        tar.addfile(info, io.BytesIO(b"x"))
+    assert (extract_tarball(path, tmp_path / "repo") / "f").read_text() == "x"
+
+
+def test_a_corrupted_gzip_checksum_is_refused(tmp_path):
+    src = build(tmp_path / "a.tar.gz", [("top/f", b"data" * 100)])
+    raw = bytearray(src.read_bytes())
+    raw[-8] ^= 0xFF  # the CRC32 in the gzip trailer
+    src.write_bytes(bytes(raw))
+    with pytest.raises(ArchiveError, match=archive.NOT_AN_ARCHIVE):
+        extract_tarball(src, tmp_path / "repo")
+    assert not (tmp_path / "repo").exists()
+
+
+def test_a_truncated_gzip_is_refused(tmp_path):
+    src = build(tmp_path / "a.tar.gz", [("top/f", b"data" * 100)])
+    src.write_bytes(src.read_bytes()[:-12])
+    with pytest.raises(ArchiveError, match=archive.NOT_AN_ARCHIVE):
+        extract_tarball(src, tmp_path / "repo")
+
+
+def test_no_file_handle_is_left_open(tmp_path):
+    good = build(tmp_path / "g.tar.gz", [("top/f", b"1")])
+    bad = build(tmp_path / "b.tar.gz", [("top/f", b"1"), ("top/.git/x", b"2")])
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        extract_tarball(good, tmp_path / "r1")
+        with pytest.raises(ArchiveError):
+            extract_tarball(bad, tmp_path / "r2")
+        gc.collect()
+    assert [w for w in caught if issubclass(w.category, ResourceWarning)] == []
+
+
+def test_an_unreadable_archive_is_refused(tmp_path):
+    bad = tmp_path / "bad.tar.gz"
+    bad.write_bytes(b"not a tarball")
+    with pytest.raises(ArchiveError, match=archive.NOT_AN_ARCHIVE):
+        extract_tarball(bad, tmp_path / "repo")

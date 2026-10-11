@@ -1,0 +1,15 @@
+metrics_to_run:
+  - plan_files_recall
+  - plan_quality
+  - pr_description_quality
+  - tool_call_count
+  - multi_turn_trajectory_quality   # managed built-in; exploratory (spike S2)
+custom_metrics:
+  - name: plan_files_recall
+    custom_function_file: metrics/plan_files_recall.py
+  - name: plan_quality
+    custom_function_file: metrics/plan_quality.py
+  - name: pr_description_quality
+    custom_function_file: metrics/pr_description_quality.py
+  - name: tool_call_count
+    custom_function_file: metrics/tool_call_count.py
